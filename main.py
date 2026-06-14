@@ -1,142 +1,94 @@
 import os
-import logging
-from flask import Flask
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup
-from docx import Document
-from openai import OpenAI
+from google import genai
 
-===== ENV VARIABLES =====
+# ==========================================
+# CONFIGURATION
+# ==========================================
+EPUB_FILE_PATH = "your_book.epub"  # Replace with your EPUB file path
+OUTPUT_DIR = "output_chapters"     # Directory where the .txt files will be saved
+MODEL_NAME = "gemini-2.5-flash"    # Standard Gemini model for text tasks
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-HF_TOKEN = os.getenv("HF_TOKEN")
+def extract_text_from_html(html_content):
+    """Parses HTML content from the EPUB and returns plain text."""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    # Extract text, replacing block elements with newlines for readability
+    text = soup.get_text(separator='\n\n', strip=True)
+    return text
 
-===== API CLIENT =====
+def get_chapter_summary(client, chapter_text):
+    """Integrates with Gemini to process the chapter text."""
+    # We are asking for a summary here, but you can change this prompt to 
+    # translate the text, extract characters, fix grammar, etc.
+    prompt = (
+        "You are an AI assistant helping to process a book. "
+        "Please provide a 2-3 sentence summary of the following chapter text. "
+        "If the text is too short or just a title page, just say 'No summary needed.'\n\n"
+        f"Text:\n{chapter_text[:5000]}" # Truncating to 5000 chars to save bandwidth, remove slicing if you want the whole chapter processed
+    )
+    
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt
+        )
+        return response.text.strip()
+    except Exception as e:
+        return f"[Gemini API Error: {e}]"
 
-client = OpenAI(
-base_url="https://router.huggingface.co/v1",
-api_key=HF_TOKEN,
-)
+def main():
+    # 1. Initialize Gemini Client
+    # It automatically picks up the GEMINI_API_KEY environment variable.
+    # Alternatively, you can do: genai.Client(api_key="YOUR_API_KEY_HERE")
+    print("Initializing Gemini Client...")
+    client = genai.Client()
 
-logging.basicConfig(level=logging.INFO)
+    # 2. Create output directory if it doesn't exist
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
 
-===== FLASK =====
+    # 3. Load the EPUB file
+    print(f"Loading EPUB: {EPUB_FILE_PATH}")
+    try:
+        book = epub.read_epub(EPUB_FILE_PATH)
+    except Exception as e:
+        print(f"Error reading EPUB: {e}")
+        return
 
-app = Flask(name)
+    # 4. Iterate through the items in the EPUB
+    chapter_count = 1
+    for item in book.get_items():
+        # EPUBs contain images, css, etc. We only want the document (HTML) files
+        if item.get_type() == ebooklib.ITEM_DOCUMENT:
+            raw_content = item.get_content()
+            chapter_text = extract_text_from_html(raw_content)
 
-===== USER SETTINGS =====
+            # Skip empty or nearly empty chapters (like blank title pages)
+            if len(chapter_text) < 50:
+                continue
+            
+            print(f"Processing Chapter {chapter_count} (Length: {len(chapter_text)} characters)...")
+            
+            # 5. Integrate with Gemini
+            summary = get_chapter_summary(client, chapter_text)
+            
+            # 6. Save to a .txt file
+            file_name = f"Chapter_{chapter_count:03d}.txt"
+            file_path = os.path.join(OUTPUT_DIR, file_name)
+            
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(f"--- GEMINI SUMMARY ---\n")
+                f.write(f"{summary}\n")
+                f.write(f"----------------------\n\n\n")
+                f.write(chapter_text)
+                
+            print(f"Saved: {file_path}")
+            chapter_count += 1
 
-user_parts = {}
+    print("\nExtraction and processing complete!")
 
-===== EPUB READ =====
-
-def extract_epub(file_path):
-book = epub.read_epub(file_path)
-chapters = []
-
-for item in book.get_items():
-    if item.get_type() == 9:
-        soup = BeautifulSoup(item.get_body_content(), "html.parser")
-        text = soup.get_text()
-        if text.strip():
-            chapters.append(text)
-
-return chapters
-
-===== SPLIT =====
-
-def split_data(chapters, parts):
-size = max(1, len(chapters) // parts)
-result = []
-
-for i in range(0, len(chapters), size):
-    result.append("\n\n".join(chapters[i:i+size]))
-
-return result
-
-===== TRANSLATE =====
-
-def translate(text):
-try:
-res = client.chat.completions.create(
-model="deepseek-ai/DeepSeek-V4-Pro:novita",
-messages=[{"role": "user", "content": f"Translate into Hindi:\n{text[:4000]}"}],
-)
-return res.choices[0].message.content
-except:
-return text
-
-===== FILE CREATE =====
-
-def create_files(text, name):
-txt = f"{name}.txt"
-doc = f"{name}.docx"
-
-with open(txt, "w", encoding="utf-8") as f:
-    f.write(text)
-
-d = Document()
-d.add_paragraph(text)
-d.save(doc)
-
-return txt, doc
-
-===== COMMANDS =====
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-await update.message.reply_text(
-"Send EPUB file\nUse /set 10 to split into parts"
-)
-
-async def set_parts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-try:
-parts = int(context.args[0])
-user_parts[update.effective_user.id] = parts
-await update.message.reply_text(f"Parts set to {parts}")
-except:
-await update.message.reply_text("Usage: /set 10")
-
-===== HANDLE FILE =====
-
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-file = await update.message.document.get_file()
-await file.download_to_drive("book.epub")
-
-await update.message.reply_text("Processing...")
-
-chapters = extract_epub("book.epub")
-parts = user_parts.get(update.effective_user.id, 5)
-
-split = split_data(chapters, parts)
-
-for i, part in enumerate(split, 1):
-    translated = translate(part)
-
-    txt, doc = create_files(translated, f"part_{i}")
-
-    await update.message.reply_document(InputFile(txt))
-    await update.message.reply_document(InputFile(doc))
-
-await update.message.reply_text("Done")
-
-===== MAIN =====
-
-def run_bot():
-app_tg = Application.builder().token(BOT_TOKEN).build()
-
-app_tg.add_handler(CommandHandler("start", start))
-app_tg.add_handler(CommandHandler("set", set_parts))
-app_tg.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-
-app_tg.run_polling()
-
-===== WEB FOR RENDER =====
-
-@app.route("/")
-def home():
-return "Bot running"
-
-if name == "main":
-run_bot()
+if __name__ == "__main__":
+    main()
+    
